@@ -4,7 +4,7 @@ import os
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
-from flask import Flask, request, send_file, jsonify, render_template_string
+from flask import Flask, request, send_file, jsonify
 
 try:
     import yt_dlp
@@ -160,22 +160,10 @@ body.dividido .dir{display:block}
 .go svg{width:18px;height:18px;transition:transform .25s var(--ease)}
 .go:hover:not(:disabled) svg{transform:translateY(2px)}
 #msg{min-height:20px;margin-top:14px;text-align:center;font-size:13px;color:var(--g)}
-#msg.err{color:var(--r)}
 .sec{
   margin:56px 0 4px;font-size:12px;font-weight:500;letter-spacing:.14em;
   text-transform:uppercase;color:var(--faint);
 }
-.item{padding:16px 0;border-top:1px solid var(--line);animation:sobe .5s var(--ease) backwards}
-.nome{display:flex;align-items:center;font-size:15px}
-.nome span.t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.dot{flex:none;width:6px;height:6px;margin-right:12px;border-radius:50%;background:var(--faint)}
-.item[data-s=baixando] .dot,.item[data-s=pronto] .dot{background:var(--g)}
-.item[data-s=erro] .dot{background:var(--r)}
-.meta{display:flex;flex-wrap:wrap;gap:4px 16px;margin:4px 0 0 18px;font-size:13px;color:var(--dim)}
-.meta a{color:var(--g);text-decoration:none}
-.meta a:hover{text-decoration:underline}
-.bar{height:2px;margin:12px 0 0 18px;background:var(--line);border-radius:2px;overflow:hidden}
-.bar i{display:block;position:relative;height:100%;width:0;background:var(--g);transition:width .5s var(--ease)}
 .player{position:relative;aspect-ratio:16/9;border-radius:18px;overflow:hidden;background:var(--surface);border:1px solid var(--line)}
 .player img{display:block;width:100%;height:100%;object-fit:cover}
 .play{
@@ -233,8 +221,6 @@ body.dividido .dir{display:block}
     </button>
   </div></div></div>
   <div id="msg"></div>
-  <h2 id="fila-t" class="sec" hidden>downloads</h2>
-  <div id="fila"></div>
   </div>
   <aside class="dir" id="dir" aria-label="Vídeo">
     <div class="player" id="player">
@@ -322,4 +308,175 @@ async function carregar(url, id) {
     });
     const d = await r.json();
     if (id !== infoReq) return;
-    if (!r.ok) throw new
+    if (!r.ok) throw new Error(d.erro || 'erro ao carregar');
+    urlAtual = url; resolucoes = d.resolucoes || [];
+    status(''); mostrarVideo(d); dividir(true); desenharFormatos(); abrir('#etapa-formato', true);
+  } catch (e) {
+    if (id === infoReq) { status(e.message, 'err'); dividir(false); }
+  }
+  if (id === infoReq) { $('#campo').classList.remove('loading'); $('#dir').classList.remove('carregando'); }
+}
+
+$('#baixar').onclick = async () => {
+  if (enviando || !fmtEscolhido) return;
+  enviando = true; const btn = $('#baixar'); btn.disabled = true; msg('');
+  try {
+    const r = await fetch('/api/baixar', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: urlAtual, formato: fmtEscolhido, resolucao: fmtEscolhido === 'mp4' ? resEscolhida : null})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.erro || 'erro ao baixar');
+    
+    const a = document.createElement('a');
+    a.href = d.url; a.download = d.nome; a.rel = 'noopener';
+    document.body.append(a); a.click(); a.remove();
+
+    $('#link').value = ''; status(''); resetar(); dividir(false);
+    msg('baixado com sucesso!'); setTimeout(() => msg(''), 2500);
+  } catch (e) {
+    msg(e.message, true);
+  }
+  btn.disabled = false; enviando = false;
+};
+
+let dividido = false, tokenDiv = 0, videoAtual = null;
+const reduzido = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const empilhado = () => matchMedia('(max-width: 1040px)').matches;
+
+function fmtDur(s) {
+  if (!s) return ''; s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), seg = s % 60;
+  const dois = n => String(n).padStart(2, '0');
+  return h ? h + ':' + dois(m) + ':' + dois(seg) : m + ':' + dois(seg);
+}
+function pararPlayer() { $('#player').classList.remove('tocando'); $('#tela').replaceChildren(); }
+function mostrarVideo(d) {
+  videoAtual = d; pararPlayer(); $('#v-aviso').textContent = '';
+  const capa = $('#capa'); capa.hidden = !d.capa; capa.src = d.capa || '';
+  const dur = fmtDur(d.duracao); $('#dur').textContent = dur; $('#dur').hidden = !dur;
+  $('#v-titulo').textContent = d.titulo || ''; $('#v-canal').textContent = d.canal || '';
+  const tem = !!(d.descricao && d.descricao.trim());
+  $('#desc-btn').hidden = !tem; $('#desc-txt').textContent = tem ? d.descricao.trim() : '';
+  $('#desc-txt').scrollTop = 0; abrir('#desc', false); $('#desc-rot').textContent = 'ver descrição';
+}
+$('#play').onclick = () => {
+  const v = videoAtual; if (!v || !v.embed) return;
+  const no = document.createElement('iframe');
+  no.src = 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(v.embed) + '?autoplay=1';
+  no.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
+  no.allowFullscreen = true; $('#tela').replaceChildren(no); $('#player').classList.add('tocando');
+};
+$('#desc-btn').onclick = () => {
+  const ab = !$('#desc').classList.contains('open');
+  abrir('#desc', ab); $('#desc-rot').textContent = ab ? 'ocultar descrição' : 'ver descrição';
+};
+
+async function dividir(on) {
+  if (on === dividido) return;
+  dividido = on; const tk = ++tokenDiv; const esq = $('#esq'), dir = $('#dir');
+  const dur = reduzido ? 0 : 650; const desloc = empilhado() ? 'translateY(24px)' : 'translateX(56px)';
+  let saida = null;
+  if (!on) {
+    pararPlayer();
+    if (dur) {
+      saida = dir.animate([{opacity: 1, transform: 'none'}, {opacity: 0, transform: desloc}], {duration: 220, fill: 'forwards'});
+      await saida.finished.catch(() => {});
+    }
+  }
+  if (tk !== tokenDiv) { if (saida) saida.cancel(); return; }
+  const antes = esq.getBoundingClientRect();
+  document.body.classList.toggle('dividido', on);
+  if (saida) saida.cancel();
+  const dx = antes.left - esq.getBoundingClientRect().left;
+  if (!dur) return;
+  if (dx) esq.animate([{transform: 'translateX(' + dx + 'px)'}, {transform: 'none'}], {duration: dur});
+  if (on) {
+    dir.animate([{opacity: 0, transform: desloc}, {opacity: 1, transform: 'none'}], {duration: dur, delay: 120, fill: 'backwards'});
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+def limpar_erro(e: Exception) -> str:
+    msg = str(e).replace("ERROR: ", "")
+    return msg.split("\n")[0][:160]
+
+@app.route("/", methods=["GET"])
+def index():
+    config = {"formatos": [list(f) for f in FORMATOS]}
+    html = PAGINA.replace("__CONFIG__", json.dumps(config, ensure_ascii=False))
+    return html
+
+@app.route("/api/info", methods=["POST"])
+def api_info():
+    dados = request.get_json(silent=True) or {}
+    url = dados.get("url")
+    if not url:
+        return jsonify({"erro": "URL inválida"}), 400
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        formatos = info.get("formats") or []
+        resolucoes = sorted({int(f["height"]) for f in formatos if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
+        embed = info.get("id") if str(info.get("extractor_key", "")).lower() == "youtube" else None
+        resposta = {
+            "titulo": info.get("title", ""),
+            "resolucoes": resolucoes,
+            "capa": info.get("thumbnail") or "",
+            "descricao": (info.get("description") or "")[:4000],
+            "canal": info.get("channel") or info.get("uploader") or "",
+            "duracao": info.get("duration"),
+            "embed": embed,
+        }
+        return jsonify(resposta)
+    except Exception as e:
+        return jsonify({"erro": limpar_erro(e)}), 400
+
+@app.route("/api/baixar", methods=["POST"])
+def api_baixar():
+    dados = request.get_json(silent=True) or {}
+    url = dados.get("url")
+    fmt = dados.get("formato", "mp3")
+    altura = dados.get("resolucao")
+    if not url:
+        return jsonify({"erro": "URL inválida"}), 400
+    try:
+        PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
+        outtmpl = str(PASTA_SAIDA / "%(title)s.%(ext)s")
+        ydl_opts = {
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
+        }
+        
+        if fmt == "mp4":
+            limite = f"[height<={altura}]" if altura else ""
+            ydl_opts["format"] = f"bv*{limite}[ext=mp4]+ba[ext=m4a]/b{limite}[ext=mp4]/b"
+            ydl_opts["merge_output_format"] = "mp4"
+        else:
+            codec, qual = CODECS.get(fmt, ("mp3", "192"))
+            pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
+            if qual: pp["preferredquality"] = qual
+            ydl_opts["format"] = "bestaudio/best"
+            ydl_opts["postprocessors"] = [pp]
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            if fmt != "mp4":
+                filename = str(Path(filename).with_suffix(f".{codec}"))
+        
+        nome_arquivo = Path(filename).name
+        return send_file(filename, as_attachment=True, download_name=nome_arquivo)
+    except Exception as e:
+        return jsonify({"erro": limpar_erro(e)}), 400
