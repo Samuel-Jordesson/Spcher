@@ -12,7 +12,6 @@ try:
 except ImportError:
     yt_dlp = None
 
-# Na Vercel, apenas a pasta /tmp tem permissão de escrita
 PASTA_SAIDA = Path(tempfile.gettempdir()) / "downloads"
 
 FORMATOS = [
@@ -343,7 +342,6 @@ $('#baixar').onclick = async () => {
     const d = await r.json();
     if (!r.ok) throw new Error(d.erro || 'erro ao baixar');
     
-    // Iniciar o download direto do arquivo gerado
     const a = document.createElement('a');
     a.href = d.url; a.download = d.nome; a.rel = 'noopener';
     document.body.append(a); a.click(); a.remove();
@@ -420,14 +418,6 @@ def limpar_erro(e: Exception) -> str:
     msg = str(e).replace("ERROR: ", "")
     return msg.split("\n")[0][:160]
 
-def escolher_direto(formatos: list[dict]) -> str | None:
-    candidatos = [
-        f for f in formatos
-        if f.get("url") and f.get("protocol") in ("http", "https")
-        and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
-    ]
-    return candidatos[0]["url"] if candidatos else None
-
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -438,7 +428,7 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def do_POST(self):
-        content_length = int(self.headers.get('Content-Length', 0))
+        content_length = int(self.headers.get('Content-Length', 0)) alternativo = 0
         body = self.rfile.read(content_length)
         try:
             dados = json.loads(body.decode('utf-8'))
@@ -450,6 +440,13 @@ class handler(BaseHTTPRequestHandler):
             return
 
         query = self.path
+        # Forçamos o player client para android/ios/web_safari para evitar o bloqueio de bot da Vercel
+        ydl_base_opts = {
+            "quiet": True,
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
+        }
+
         if "action=info" in query:
             url = dados.get("url")
             if not url:
@@ -457,7 +454,7 @@ class handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             try:
-                ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True}
+                ydl_opts = {**ydl_base_opts, "skip_download": True}
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                 formatos = info.get("formats") or []
@@ -493,11 +490,8 @@ class handler(BaseHTTPRequestHandler):
             try:
                 PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
                 outtmpl = str(PASTA_SAIDA / "%(title)s.%(ext)s")
-                ydl_opts = {
-                    "outtmpl": outtmpl,
-                    "noplaylist": True,
-                    "quiet": True,
-                }
+                ydl_opts = {**ydl_base_opts, "outtmpl": outtmpl}
+                
                 if fmt == "mp4":
                     limite = f"[height<={altura}]" if altura else ""
                     ydl_opts["format"] = f"bv*{limite}[ext=mp4]+ba[ext=m4a]/b{limite}[ext=mp4]/b"
@@ -516,8 +510,6 @@ class handler(BaseHTTPRequestHandler):
                         filename = str(Path(filename).with_suffix(f".{codec}"))
                 
                 nome_arquivo = Path(filename).name
-                # Na Vercel, o arquivo gerado fica em /tmp e pode ser baixado pelo client ou reencaminhado.
-                # Como a Vercel Serverless Function processa e responde na mesma requisição HTTP:
                 with open(filename, "rb") as f:
                     conteudo = f.read()
                 
