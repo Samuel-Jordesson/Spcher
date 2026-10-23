@@ -3,15 +3,15 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
-from http.server import BaseHTTPRequestHandler
+from urllib.parse import quote
+from flask import Flask, request, send_file, jsonify, render_template_string
 
 try:
     import yt_dlp
-    from yt_dlp.utils import DownloadError
 except ImportError:
     yt_dlp = None
 
+app = Flask(__name__)
 PASTA_SAIDA = Path(tempfile.gettempdir()) / "downloads"
 
 FORMATOS = [
@@ -317,7 +317,7 @@ async function carregar(url, id) {
   $('#campo').classList.add('loading'); $('#dir').classList.add('carregando');
   status('carregando vídeo...');
   try {
-    const r = await fetch('/api/index?action=info', {
+    const r = await fetch('/api/info', {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url})
     });
     const d = await r.json();
@@ -335,7 +335,7 @@ $('#baixar').onclick = async () => {
   if (enviando || !fmtEscolhido) return;
   enviando = true; const btn = $('#baixar'); btn.disabled = true; msg('');
   try {
-    const r = await fetch('/api/index?action=baixar', {
+    const r = await fetch('/api/baixar', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({url: urlAtual, formato: fmtEscolhido, resolucao: fmtEscolhido === 'mp4' ? resEscolhida : null})
     });
@@ -418,108 +418,79 @@ def limpar_erro(e: Exception) -> str:
     msg = str(e).replace("ERROR: ", "")
     return msg.split("\n")[0][:160]
 
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        config = {"formatos": [list(f) for f in FORMATOS]}
-        html = PAGINA.replace("__CONFIG__", json.dumps(config, ensure_ascii=False))
-        self.wfile.write(html.encode("utf-8"))
+@app.route("/", methods=["GET"])
+def index():
+    config = {"formatos": [list(f) for f in FORMATOS]}
+    html = PAGINA.replace("__CONFIG__", json.dumps(config, ensure_ascii=False))
+    return html
 
-    def do_POST(self):
-        content_length = int(self.headers.get('Content-Length', 0)) alternativo = 0
-        body = self.rfile.read(content_length)
-        try:
-            dados = json.loads(body.decode('utf-8'))
-        except Exception:
-            self.send_response(400)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"erro": "JSON inválido"}).encode('utf-8'))
-            return
-
-        query = self.path
-        # Forçamos o player client para android/ios/web_safari para evitar o bloqueio de bot da Vercel
-        ydl_base_opts = {
+@app.route("/api/info", methods=["POST"])
+def api_info():
+    dados = request.get_json(silent=True) or {}
+    url = dados.get("url")
+    if not url:
+        return jsonify({"erro": "URL inválida"}), 400
+    try:
+        ydl_opts = {
             "quiet": True,
+            "skip_download": True,
             "noplaylist": True,
             "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
         }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        formatos = info.get("formats") or []
+        resolucoes = sorted({int(f["height"]) for f in formatos if f.get("height") and f.get("vcodec"] not in (None, "none")}, reverse=True)
+        embed = info.get("id") if str(info.get("extractor_key", "")).lower() == "youtube" else None
+        resposta = {
+            "titulo": info.get("title", ""),
+            "resolucoes": resolucoes,
+            "capa": info.get("thumbnail") or "",
+            "descricao": (info.get("description") or "")[:4000],
+            "canal": info.get("channel") or info.get("uploader") or "",
+            "duracao": info.get("duration"),
+            "embed": embed,
+        }
+        return jsonify(resposta)
+    except Exception as e:
+        return jsonify({"erro": limpar_erro(e)}), 400
 
-        if "action=info" in query:
-            url = dados.get("url")
-            if not url:
-                self.send_response(400)
-                self.end_headers()
-                return
-            try:
-                ydl_opts = {**ydl_base_opts, "skip_download": True}
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                formatos = info.get("formats") or []
-                resolucoes = sorted({int(f["height"]) for f in formatos if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
-                embed = info.get("id") if str(info.get("extractor_key", "")).lower() == "youtube" else None
-                resposta = {
-                    "titulo": info.get("title", ""),
-                    "resolucoes": resolucoes,
-                    "capa": info.get("thumbnail") or "",
-                    "descricao": (info.get("description") or "")[:4000],
-                    "canal": info.get("channel") or info.get("uploader") or "",
-                    "duracao": info.get("duration"),
-                    "embed": embed,
-                }
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps(resposta, ensure_ascii=False).encode('utf-8'))
-            except Exception as e:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps({"erro": limpar_erro(e)}).encode('utf-8'))
+@app.route("/api/baixar", methods=["POST"])
+def api_baixar():
+    dados = request.get_json(silent=True) or {}
+    url = dados.get("url")
+    fmt = dados.get("formato", "mp3")
+    altura = dados.get("resolucao")
+    if not url:
+        return jsonify({"erro": "URL inválida"}), 400
+    try:
+        PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
+        outtmpl = str(PASTA_SAIDA / "%(title)s.%(ext)s")
+        ydl_opts = {
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
+        }
+        
+        if fmt == "mp4":
+            limite = f"[height<={altura}]" if altura else ""
+            ydl_opts["format"] = f"bv*{limite}[ext=mp4]+ba[ext=m4a]/b{limite}[ext=mp4]/b"
+            ydl_opts["merge_output_format"] = "mp4"
+        else:
+            codec, qual = CODECS.get(fmt, ("mp3", "192"))
+            pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
+            if qual: pp["preferredquality"] = qual
+            ydl_opts["format"] = "bestaudio/best"
+            ydl_opts["postprocessors"] = [pp]
 
-        elif "action=baixar" in query:
-            url = dados.get("url")
-            fmt = dados.get("formato", "mp3")
-            altura = dados.get("resolucao")
-            if not url:
-                self.send_response(400)
-                self.end_headers()
-                return
-            try:
-                PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
-                outtmpl = str(PASTA_SAIDA / "%(title)s.%(ext)s")
-                ydl_opts = {**ydl_base_opts, "outtmpl": outtmpl}
-                
-                if fmt == "mp4":
-                    limite = f"[height<={altura}]" if altura else ""
-                    ydl_opts["format"] = f"bv*{limite}[ext=mp4]+ba[ext=m4a]/b{limite}[ext=mp4]/b"
-                    ydl_opts["merge_output_format"] = "mp4"
-                else:
-                    codec, qual = CODECS.get(fmt, ("mp3", "192"))
-                    pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
-                    if qual: pp["preferredquality"] = qual
-                    ydl_opts["format"] = "bestaudio/best"
-                    ydl_opts["postprocessors"] = [pp]
-
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    filename = ydl.prepare_filename(info)
-                    if fmt != "mp4":
-                        filename = str(Path(filename).with_suffix(f".{codec}"))
-                
-                nome_arquivo = Path(filename).name
-                with open(filename, "rb") as f:
-                    conteudo = f.read()
-                
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(nome_arquivo)}")
-                self.end_headers()
-                self.wfile.write(conteudo)
-            except Exception as e:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps({"erro": limpar_erro(e)}).encode('utf-8'))
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            if fmt != "mp4":
+                filename = str(Path(filename).with_suffix(f".{codec}"))
+        
+        nome_arquivo = Path(filename).name
+        return send_file(filename, as_attachment=True, download_name=nome_arquivo)
+    except Exception as e:
+        return jsonify({"erro": limpar_erro(e)}), 400
