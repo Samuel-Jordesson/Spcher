@@ -480,3 +480,6 @@ def api_baixar():
         return send_file(filename, as_attachment=True, download_name=nome_arquivo)
     except Exception as e:
         return jsonify({"erro": limpar_erro(e)}), 400
+
+        if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
