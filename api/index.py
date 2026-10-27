@@ -1,10 +1,12 @@
 # api/index.py
 import json
+import mimetypes
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, Response, jsonify, request, stream_with_context
 
 try:
     import yt_dlp
@@ -404,26 +406,34 @@ def limpar_erro(e: Exception) -> str:
     msg = str(e).replace("ERROR: ", "")
     return msg.split("\n")[0][:160]
 
+
+def opcoes_base() -> dict:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        # o YouTube exige um runtime JS para liberar os formatos; usa o que estiver instalado
+        "js_runtimes": {"deno": {}, "node": {}, "bun": {}},
+    }
+
+
 @app.route("/", methods=["GET"])
 def index():
     config = {"formatos": [list(f) for f in FORMATOS]}
     html = PAGINA.replace("__CONFIG__", json.dumps(config, ensure_ascii=False))
     return html
 
+
 @app.route("/api/info", methods=["POST"])
 def api_info():
+    if yt_dlp is None:
+        return jsonify({"erro": "yt-dlp não está instalado no servidor"}), 500
     dados = request.get_json(silent=True) or {}
     url = dados.get("url")
-    if not url:
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return jsonify({"erro": "URL inválida"}), 400
     try:
-        ydl_opts = {
-            "quiet": True,
-            "skip_download": True,
-            "noplaylist": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL({**opcoes_base(), "skip_download": True}) as ydl:
             info = ydl.extract_info(url, download=False)
         formatos = info.get("formats") or []
         resolucoes = sorted({int(f["height"]) for f in formatos if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
@@ -441,45 +451,90 @@ def api_info():
     except Exception as e:
         return jsonify({"erro": limpar_erro(e)}), 400
 
+
 @app.route("/api/baixar", methods=["POST"])
 def api_baixar():
+    if yt_dlp is None:
+        return jsonify({"erro": "yt-dlp não está instalado no servidor"}), 500
     dados = request.get_json(silent=True) or {}
     url = dados.get("url")
     fmt = dados.get("formato", "mp3")
     altura = dados.get("resolucao")
-    if not url:
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return jsonify({"erro": "URL inválida"}), 400
+    if fmt not in [f[0] for f in FORMATOS]:
+        return jsonify({"erro": "formato inválido"}), 400
+    if altura is not None and not isinstance(altura, int):
+        return jsonify({"erro": "resolução inválida"}), 400
+
+    PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
+    pasta = Path(tempfile.mkdtemp(prefix="job", dir=PASTA_SAIDA))
     try:
-        PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
-        outtmpl = str(PASTA_SAIDA / "%(title)s.%(ext)s")
         ydl_opts = {
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "quiet": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
+            **opcoes_base(),
+            "outtmpl": str(pasta / "%(title).150B.%(ext)s"),
+            "windowsfilenames": True,
+            # vídeos longos (2h+): resiste a quedas de conexão e ao limite de velocidade do YouTube
+            "retries": 20,
+            "fragment_retries": 20,
+            "extractor_retries": 5,
+            "socket_timeout": 30,
+            "http_chunk_size": 10 * 1024 * 1024,
+            "concurrent_fragment_downloads": 4,
         }
-        
         if fmt == "mp4":
             limite = f"[height<={altura}]" if altura else ""
-            ydl_opts["format"] = f"bv*{limite}[ext=mp4]+ba[ext=m4a]/b{limite}[ext=mp4]/b"
+            ydl_opts["format"] = f"bv*{limite}[ext=mp4]+ba[ext=m4a]/b{limite}[ext=mp4]/bv*{limite}+ba/b{limite}/b"
             ydl_opts["merge_output_format"] = "mp4"
         else:
-            codec, qual = CODECS.get(fmt, ("mp3", "192"))
+            codec, qual = CODECS[fmt]
             pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
-            if qual: pp["preferredquality"] = qual
+            if qual:
+                pp["preferredquality"] = qual
             ydl_opts["format"] = "bestaudio/best"
             ydl_opts["postprocessors"] = [pp]
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if fmt != "mp4":
-                filename = str(Path(filename).with_suffix(f".{codec}"))
-        
-        nome_arquivo = Path(filename).name
-        return send_file(filename, as_attachment=True, download_name=nome_arquivo)
+        # caminho final real (já com a extensão depois da conversão/junção)
+        arquivos = [Path(rd["filepath"]) for rd in info.get("requested_downloads") or [] if rd.get("filepath")]
+        arquivos = [a for a in arquivos if a.is_file()]
+        if not arquivos:
+            raise RuntimeError("o download terminou mas o arquivo não foi encontrado")
+        arquivo = arquivos[0]
+        # o navegador busca o arquivo em outra requisição (streaming, sem carregar tudo na memória)
+        return jsonify({"url": f"/api/arquivo/{pasta.name}/{quote(arquivo.name)}", "nome": arquivo.name})
     except Exception as e:
+        shutil.rmtree(pasta, ignore_errors=True)
         return jsonify({"erro": limpar_erro(e)}), 400
 
-        if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+
+@app.route("/api/arquivo/<job>/<path:nome>", methods=["GET"])
+def api_arquivo(job, nome):
+    base = PASTA_SAIDA.resolve()
+    try:
+        alvo = (base / job / nome).resolve()
+        valido = alvo.parent.parent == base and alvo.is_file()
+    except (OSError, ValueError):
+        valido = False
+    if not valido:
+        return jsonify({"erro": "arquivo não encontrado (já foi baixado ou expirou)"}), 404
+
+    tamanho = alvo.stat().st_size
+
+    def gerar():
+        try:
+            with open(alvo, "rb") as f:
+                while bloco := f.read(1024 * 1024):
+                    yield bloco
+        finally:
+            shutil.rmtree(alvo.parent, ignore_errors=True)  # apaga a cópia do servidor
+
+    resp = Response(stream_with_context(gerar()), mimetype=mimetypes.guess_type(alvo.name)[0] or "application/octet-stream")
+    resp.headers["Content-Length"] = str(tamanho)
+    resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(alvo.name)}"
+    return resp
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, threaded=True)

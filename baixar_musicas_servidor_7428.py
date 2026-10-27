@@ -36,7 +36,13 @@ try:
     import yt_dlp
     from yt_dlp.utils import DownloadError
 except ImportError:
-    sys.exit("yt-dlp não está instalado. Rode: pip install -U yt-dlp")
+    # rodou com o python do sistema: tenta de novo com o python do venv ao lado do script
+    _pasta = Path(__file__).resolve().parent
+    for _py in (_pasta / "venv" / "bin" / "python", _pasta / "venv" / "Scripts" / "python.exe"):
+        if _py.is_file() and Path(sys.prefix).resolve() != (_pasta / "venv").resolve():
+            os.execv(str(_py), [str(_py), str(Path(__file__).resolve()), *sys.argv[1:]])
+    sys.exit("yt-dlp não está instalado. Rode:\n"
+             "  python3 -m venv venv && venv/bin/pip install -U \"yt-dlp[default]\"")
 
 try:
     import readline  # Tab completa caminhos de arquivo (Linux/macOS)
@@ -364,17 +370,36 @@ class Progresso:
         sys.stdout.flush()
 
 
-def opcoes_ydl(fmt: str, altura: int | None, pasta: Path, hooks: list, pp_hooks: list) -> dict:
-    opcoes = {
-        "outtmpl": str(pasta / "%(title)s.%(ext)s"),
+def opcoes_base() -> dict:
+    """Opções comuns a toda chamada do yt-dlp."""
+    return {
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "logger": LoggerMudo(),
+        # o YouTube exige um runtime JS para liberar os formatos; usa o que estiver instalado
+        "js_runtimes": {"deno": {}, "node": {}, "bun": {}},
+    }
+
+
+def opcoes_ydl(fmt: str, altura: int | None, pasta: Path, hooks: list, pp_hooks: list) -> dict:
+    opcoes = {
+        **opcoes_base(),
+        "outtmpl": str(pasta / "%(title).150B.%(ext)s"),
         "noprogress": True,
         "windowsfilenames": True,
         "progress_hooks": hooks,
         "postprocessor_hooks": pp_hooks,
+        # vídeos longos (2h+): resiste a quedas de conexão e ao limite de velocidade do YouTube
+        "retries": 20,
+        "fragment_retries": 20,
+        "extractor_retries": 5,
+        "file_access_retries": 5,
+        "retry_sleep_functions": {"http": lambda n: min(2 ** n, 30), "fragment": lambda n: min(2 ** n, 30)},
+        "socket_timeout": 30,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "concurrent_fragment_downloads": 4,
+        "continuedl": True,
     }
     if FFMPEG_DIR:
         opcoes["ffmpeg_location"] = FFMPEG_DIR
@@ -1109,6 +1134,7 @@ class Estado:
         self.fila: queue.Queue = queue.Queue()
         self.proximo_id = 1
         self.parando = False
+        self.enviando: dict[str, int] = {}  # pasta do job -> transferências em andamento
 
     def adicionar(self, links: list[str], fmt: str, altura: int | None) -> list[int]:
         ids = []
@@ -1147,7 +1173,9 @@ class Estado:
         """Apaga downloads prontos que o navegador nunca buscou (ex.: download bloqueado)."""
         agora = time.time()
         with self.lock:
-            velhos = [j for j in self.jobs if j["status"] == "pronto" and agora - j["pronto_em"] > ttl]
+            # arquivo grande ainda indo para o navegador não pode ser apagado no meio
+            velhos = [j for j in self.jobs if j["status"] == "pronto" and agora - j["pronto_em"] > ttl
+                      and not self.enviando.get(j["dir"])]
             for j in velhos:
                 j["status"], j["files"] = "expirado", []
         for j in velhos:
@@ -1335,13 +1363,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         enviado = False
+        pasta = str(alvo.parent)
+        with estado.lock:
+            estado.enviando[pasta] = estado.enviando.get(pasta, 0) + 1
         try:
             with open(alvo, "rb") as f:
-                shutil.copyfileobj(f, self.wfile, 256 * 1024)
+                shutil.copyfileobj(f, self.wfile, 1024 * 1024)
             self.wfile.flush()
             enviado = True
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass  # download interrompido: mantém o arquivo para tentar de novo
+        finally:
+            with estado.lock:
+                estado.enviando[pasta] -= 1
+                if not estado.enviando[pasta]:
+                    del estado.enviando[pasta]
+                    # reinicia o prazo: quem não terminou ainda tem tempo de tentar de novo
+                    for j in estado.jobs:
+                        if j.get("dir") == pasta and j["status"] == "pronto":
+                            j["pronto_em"] = time.time()
         if enviado:
             self._aguardar_cliente()
             estado.entregue(alvo)
@@ -1385,7 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
                 return self._json({"erro": "link inválido"}, 400)
             try:
-                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True, "logger": LoggerMudo()}) as ydl:
+                with yt_dlp.YoutubeDL({**opcoes_base(), "skip_download": True}) as ydl:
                     info = ydl.extract_info(url, download=False)
                 formatos = info.get("formats") or []
                 resolucoes = sorted({int(f["height"]) for f in formatos
